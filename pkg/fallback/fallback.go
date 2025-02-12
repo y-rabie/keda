@@ -18,17 +18,19 @@ package fallback
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"reflect"
 	"strconv"
 
+	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-
-	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 )
 
 var log = logf.Log.WithName("fallback")
@@ -37,17 +39,6 @@ func isFallbackEnabled(scaledObject *kedav1alpha1.ScaledObject, metricSpec v2.Me
 	if scaledObject.Spec.Fallback == nil {
 		return false
 	}
-
-	// If we are using ScalingModifiers, we only care whether its metric type is AverageValue.
-	// If not, test the type of metricSpec passed.
-	if scaledObject.IsUsingModifiers() && scaledObject.Spec.Advanced.ScalingModifiers.MetricType != v2.AverageValueMetricType {
-		log.V(0).Info("Fallback can only be enabled for scalingModifiers with metric of type AverageValue", "scaledObject.Namespace", scaledObject.Namespace, "scaledObject.Name", scaledObject.Name)
-		return false
-	} else if !scaledObject.IsUsingModifiers() && metricSpec.External.Target.Type != v2.AverageValueMetricType {
-		log.V(0).Info("Fallback can only be enabled for triggers with metric of type AverageValue", "scaledObject.Namespace", scaledObject.Namespace, "scaledObject.Name", scaledObject.Name)
-		return false
-	}
-
 	return true
 }
 
@@ -81,7 +72,11 @@ func GetMetricsWithFallback(ctx context.Context, client runtimeclient.Client, me
 		log.Info("Failed to validate ScaledObject Spec. Please check that parameters are positive integers", "scaledObject.Namespace", scaledObject.Namespace, "scaledObject.Name", scaledObject.Name)
 		return nil, false, suppressedError
 	case *healthStatus.NumberOfFailures > scaledObject.Spec.Fallback.FailureThreshold:
-		return doFallback(scaledObject, metricSpec, metricName, suppressedError), true, nil
+		l := doFallback(ctx, client, scaledObject, metricSpec, metricName, suppressedError)
+		if l == nil {
+			return l, false, fmt.Errorf("error performing fallback")
+		}
+		return l, true, nil
 	default:
 		return nil, false, suppressedError
 	}
@@ -108,20 +103,75 @@ func HasValidFallback(scaledObject *kedav1alpha1.ScaledObject) bool {
 		modifierChecking
 }
 
-func doFallback(scaledObject *kedav1alpha1.ScaledObject, metricSpec v2.MetricSpec, metricName string, suppressedError error) []external_metrics.ExternalMetricValue {
-	replicas := int64(scaledObject.Spec.Fallback.Replicas)
-	var normalisationValue int64
+func getReadyReplicasCount(ctx context.Context, client runtimeclient.Client, scaledObject *kedav1alpha1.ScaledObject) (int32, error) {
+
+	// Fetching the scaleTargetRef as an unstructured.
+	u := &unstructured.Unstructured{}
+	if scaledObject.Status.ScaleTargetGVKR == nil {
+		return 0, fmt.Errorf("scaledObject.Status.ScaleTargetGVKR is empty")
+	}
+	u.SetGroupVersionKind(scaledObject.Status.ScaleTargetGVKR.GroupVersionKind())
+
+	if err := client.Get(ctx, runtimeclient.ObjectKey{Namespace: scaledObject.Namespace, Name: scaledObject.Spec.ScaleTargetRef.Name}, u); err != nil {
+		return 0, fmt.Errorf("error getting scaleTargetRef: %v", err)
+	}
+
+	// TODO: there may be a better way of getting an unstructured object, marshalling it to JSON,
+	// then unmarshalling it again into our object type. Maybe just Get() it directly into our object?
+	jsonBytes, err := u.MarshalJSON()
+	if err != nil {
+		return 0, fmt.Errorf("error encoding scaleTargetRef into json: %v", err)
+	}
+
+	s := &struct {
+		Status struct {
+			ReadyReplicas int32 `json:"readyReplicas"`
+		} `json:"status"`
+	}{}
+
+	if err = json.Unmarshal(jsonBytes, s); err != nil {
+		return 0, fmt.Errorf("error decoding json to get readyReplicas: %v", err)
+	}
+
+	// Guard against the case where readyReplicas=0, because we'll be dividing by it later.
+	if s.Status.ReadyReplicas == 0 {
+		return 0, fmt.Errorf("status.readyReplicas is 0 in scaleTargetRef")
+	}
+
+	return s.Status.ReadyReplicas, nil
+}
+
+func doFallback(ctx context.Context, client runtimeclient.Client, scaledObject *kedav1alpha1.ScaledObject, metricSpec v2.MetricSpec, metricName string, suppressedError error) []external_metrics.ExternalMetricValue {
+
+	replicas := float64(scaledObject.Spec.Fallback.Replicas)
+
+	// If the metricType is Value, we get the number of readyReplicas, and divide replicas by it.
+	if (!scaledObject.IsUsingModifiers() && metricSpec.External.Target.Type == v2.ValueMetricType) ||
+		(scaledObject.IsUsingModifiers() && scaledObject.Spec.Advanced.ScalingModifiers.MetricType == v2.ValueMetricType) {
+		readyReplicas, err := getReadyReplicasCount(ctx, client, scaledObject)
+		if err != nil {
+			log.Error(err, "failed to do fallback for metric of type Value", "scaledObject.Namespace", scaledObject.Namespace, "scaledObject.Name", scaledObject.Name, "metricName", metricName)
+			return nil
+		}
+		replicas = replicas / float64(readyReplicas)
+	}
+
+	var normalisationValue float64
 	if !scaledObject.IsUsingModifiers() {
-		normalisationValue = int64(metricSpec.External.Target.AverageValue.AsApproximateFloat64())
+		if metricSpec.External.Target.Type == v2.AverageValueMetricType {
+			normalisationValue = metricSpec.External.Target.AverageValue.AsApproximateFloat64()
+		} else if metricSpec.External.Target.Type == v2.ValueMetricType {
+			normalisationValue = metricSpec.External.Target.Value.AsApproximateFloat64()
+		}
 	} else {
-		value, _ := strconv.ParseInt(scaledObject.Spec.Advanced.ScalingModifiers.Target, 10, 64)
+		value, _ := strconv.ParseFloat(scaledObject.Spec.Advanced.ScalingModifiers.Target, 64)
 		normalisationValue = value
 		metricName = kedav1alpha1.CompositeMetricName
 	}
 
 	metric := external_metrics.ExternalMetricValue{
 		MetricName: metricName,
-		Value:      *resource.NewMilliQuantity(normalisationValue*1000*replicas, resource.DecimalSI),
+		Value:      *resource.NewMilliQuantity(int64(normalisationValue*1000*replicas), resource.DecimalSI),
 		Timestamp:  metav1.Now(),
 	}
 	fallbackMetrics := []external_metrics.ExternalMetricValue{metric}
