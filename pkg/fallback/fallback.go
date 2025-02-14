@@ -18,7 +18,6 @@ package fallback
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -103,6 +102,10 @@ func HasValidFallback(scaledObject *kedav1alpha1.ScaledObject) bool {
 		modifierChecking
 }
 
+// This depends on the fact that Deployment, StatefulSet, ReplicaSet (and Argo Rollouts CRD) all have the status.readyReplicas
+// field that we can use directly instead of getting their selector and listing all pods with that selector, the way HPA actually
+// does it. Thus, we offset that overhead to the respective controller of the CRD.
+// Any other CRD that doesn't have `.status.readyReplicas` won't support scaling on Value metrics.
 func getReadyReplicasCount(ctx context.Context, client runtimeclient.Client, scaledObject *kedav1alpha1.ScaledObject) (int32, error) {
 
 	// Fetching the scaleTargetRef as an unstructured.
@@ -116,29 +119,36 @@ func getReadyReplicasCount(ctx context.Context, client runtimeclient.Client, sca
 		return 0, fmt.Errorf("error getting scaleTargetRef: %v", err)
 	}
 
-	// TODO: there may be a better way of getting an unstructured object, marshalling it to JSON,
-	// then unmarshalling it again into our object type. Maybe just Get() it directly into our object?
-	jsonBytes, err := u.MarshalJSON()
+	readyReplicasField, found, err := unstructured.NestedFieldCopy(u.Object, "status", "readyReplicas")
+	if !found {
+		return 0, fmt.Errorf("error accessing status.readyReplicas in scaleTarget object: no such field exists")
+	}
 	if err != nil {
-		return 0, fmt.Errorf("error encoding scaleTargetRef into json: %v", err)
+		return 0, fmt.Errorf("error accessing status.readyReplicas in scaleTarget object: %v", err)
 	}
 
-	s := &struct {
-		Status struct {
-			ReadyReplicas int32 `json:"readyReplicas"`
-		} `json:"status"`
-	}{}
+	v := reflect.ValueOf(readyReplicasField)
+	// This is probably impossible if the field is found, but just for extra guard.
+	if v.IsZero() {
+		return 0, fmt.Errorf("error accessing status.readyReplicas in scaleTarget object: field is nil")
+	}
 
-	if err = json.Unmarshal(jsonBytes, s); err != nil {
-		return 0, fmt.Errorf("error decoding json to get readyReplicas: %v", err)
+	var readyReplicas int32 = 0
+	// readyReplicas can be a signed or unsigned integer, otherwise return an error.
+	if v.CanInt() {
+		readyReplicas = int32(v.Int())
+	} else if v.CanUint() {
+		readyReplicas = int32(v.Uint())
+	} else {
+		return 0, fmt.Errorf("unexpected type of status.readyReplicas in scaleTarget object, expected (int64/int32), got: %v", reflect.TypeOf(readyReplicas))
 	}
 
 	// Guard against the case where readyReplicas=0, because we'll be dividing by it later.
-	if s.Status.ReadyReplicas == 0 {
+	if readyReplicas == 0 {
 		return 0, fmt.Errorf("status.readyReplicas is 0 in scaleTargetRef")
 	}
 
-	return s.Status.ReadyReplicas, nil
+	return readyReplicas, nil
 }
 
 func doFallback(ctx context.Context, client runtimeclient.Client, scaledObject *kedav1alpha1.ScaledObject, metricSpec v2.MetricSpec, metricName string, suppressedError error) []external_metrics.ExternalMetricValue {
